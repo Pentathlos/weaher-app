@@ -1,0 +1,221 @@
+name: Verify Server and Dependencies
+
+on:
+  workflow_call:
+    outputs:
+      workflow-status:
+        description: "Status of the workflow"
+        value: ${{ jobs.final-validation.outputs.status }}
+    inputs:
+      python-version:
+        description: 'Version de Python à utiliser'
+        required: false
+        default: '3.9'
+        type: string
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  SERVER_PORT: 5001
+  REQUIRED_FILES: |
+    access.log
+    acceuil.html
+    expose_py.py
+    middleware.py
+    pays.html
+    property.env
+    reponse_meteo.html
+    ville.html
+jobs:
+  verify-structure:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Verify required files
+        run: |
+          echo "Vérification de la présence des fichiers requis..."
+          $requiredFiles = @(
+            "access.log",
+            "acceuil.html",
+            "expose_py.py",
+            "middleware.py",
+            "pays.html",
+            "property.env",
+            "reponse_meteo.html",
+            "reponse_pays.html",
+            "ville.html"
+          )
+          $missingFiles = @()
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path $file)) {
+              $missingFiles += $file
+            }
+          }
+          if ($missingFiles.Count -gt 0) {
+            Write-Error "Fichiers manquants : $($missingFiles -join ', ')"
+            exit 1
+          } else {
+            Write-Host "Tous les fichiers requis sont présents."
+          }
+        shell: pwsh
+
+      - name: Verify HTML forms
+        run: |
+          echo "Vérification des formulaires HTML..."
+          $villeContent = Get-Content -Path ville.html -Raw
+          if (-not ($villeContent -match 'form.*action="/submit".*method="POST"' -and 
+                    $villeContent -match 'input.*name="city".*')) {
+            Write-Error "ville.html : Formulaire ou champ 'city' manquant"
+            exit 1
+          }
+          $paysContent = Get-Content -Path pays.html -Raw
+          if (-not ($paysContent -match 'form.*action="/soumettre".*method="POST"' -and 
+                    $paysContent -match 'input.*name="pays".*')) {
+            Write-Error "pays.html : Formulaire ou champ 'pays' manquant"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Verify navigation buttons
+        run: |
+          echo "Vérification des boutons de navigation..."
+          # Vérifie si le fichier acceuil.html existe
+          if (-not (Test-Path "acceuil.html")) {
+            Write-Error "Le fichier acceuil.html est introuvable au chemin acceuil.html."
+            exit 1
+          }
+          # Chargement du contenu et vérification des liens
+          $acceuilContent = Get-Content -Path "acceuil.html" -Raw
+          if (-not ($acceuilContent -match 'href="/meteo"' -and 
+            $acceuilContent -match 'href="/pays"')) {
+            Write-Error "acceuil.html : Liens de navigation manquants pour /meteo ou /pays"
+            exit 1
+          }
+          # Vérification des autres fichiers pour le bouton retour
+          foreach ($file in @('ville.html', 'pays.html', 'reponse_meteo.html')) {
+          # Vérifie si le fichier existe
+            if (-not (Test-Path $file)) {
+              Write-Error "$file est introuvable."
+              exit 1
+            }
+            $content = Get-Content -Path $file -Raw
+            if (-not ($content -match 'href="/".*Retour')) {
+              Write-Error "$file : Bouton retour manquant"
+              exit 1
+            }
+          }
+        shell: pwsh
+
+      - name: Verify response structure
+        run: |
+          echo "Vérification de la structure des réponses..."
+          $exposeContent = Get-Content -Path expose_py.py -Raw
+          $requiredFields = @(
+            'city', 'temperature', 'weather', 'humidity',  
+            'pays', 'capital', 'population', 'languages', 'region', 'area'
+          )
+          foreach ($field in $requiredFields) {
+            if (-not ($exposeContent -match $field)) {
+              Write-Error "expose_py.py : Champ '$field' manquant dans la structure de réponse"
+              exit 1
+            }
+          }
+        shell: pwsh
+
+  verify-server-dependencies:
+    needs: verify-structure
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Check and Install Dependencies
+        run: |
+          echo "Vérification et installation des dépendances..."
+        
+          function Install-IfMissing {
+            param($PackageName)
+            
+            $installed = pip list | findstr $PackageName
+            if (-not $installed) {
+                echo "Installation de $PackageName..."
+                pip install $PackageName
+            } else {
+                echo "$PackageName est déjà installé"
+            }
+          }
+        
+          $dependencies = @('requests', 'python-dotenv')
+          foreach ($dep in $dependencies) {
+            Install-IfMissing -PackageName $dep
+          }
+        
+          foreach ($dep in $dependencies) {
+            if (-not (pip list | findstr $dep)) {
+                Write-Error "Échec de l'installation de $dep"
+                exit 1
+            }
+          }
+        shell: pwsh
+
+      - name: Create test environment file
+        run: |
+          echo "API_KEY=test_key" > property.env
+        shell: pwsh
+
+      - name: Start server
+        run: |
+          Start-Process python -ArgumentList "expose_py.py" -NoNewWindow
+          $retries = 10
+          $waitTime = 5
+          $success = $false
+          for ($i = 0; $i -lt $retries; $i++) {
+            try {
+                $response = Invoke-WebRequest -Uri "http://localhost:${{ env.SERVER_PORT }}/" -ErrorAction Stop
+                if ($response.StatusCode -eq 200) {
+                    $success = $true
+                    Write-Host "Server is ready."
+                    break
+                }
+            } catch {
+                Write-Host "Waiting for the server to be ready..."
+                Start-Sleep -Seconds $waitTime
+            }
+          }
+          if (-not $success) {
+            Write-Error "Server did not become ready in time."
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Test server endpoints
+        run: |
+          $endpoints = @('/meteo', '/pays', '/')
+          foreach ($endpoint in $endpoints) {
+              Start-Process powershell -ArgumentList {
+                  try {
+                      Write-Host "Testing endpoint: $endpoint"
+                      $response = Invoke-WebRequest -Uri "http://localhost:5001$endpoint" -ErrorAction Stop
+                      if ($response.StatusCode -ne 200) {
+                          Write-Error "Endpoint $endpoint returned status code $($response.StatusCode)"
+                      } else {
+                          Write-Host "Endpoint $endpoint is responding correctly"
+                      }
+                  } catch {
+                      Write-Error "Failed to reach $endpoint"
+                      Write-Host "Error details: $($_.Exception.Message)"
+                  }
+              }
+          }
+        shell: pwsh
+Explique moi le code pour que je puisse l'expliquer pout de la présentataion, n'oublie aucune partie
